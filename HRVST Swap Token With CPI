@@ -1,6 +1,7 @@
 /*
  * HRVST Token Swap Program for Solana Blockchain
  * This program enables users to swap SOL for HRVST tokens and vice versa using Pumpfun's bonding curve.
+ * A custom gaming function is added to send a percentage of swapped SOL to a treasury account before swapping SOL with the Pumpfun account.
  */
 
 use anchor_lang::prelude::*;
@@ -18,25 +19,35 @@ mod hrvst_token_swap {
         Ok(())
     }
 
-    pub fn swap_sol_for_hrvst(ctx: Context<SwapWithPumpfun>, sol_amount: u64) -> Result<()> {
+    pub fn swap_sol_for_hrvst_with_treasury(ctx: Context<SwapWithTreasury>, sol_amount: u64, treasury_percentage: u8) -> Result<()> {
         let user_authority = &ctx.accounts.user_authority;
         let pumpfun_program = &ctx.accounts.pumpfun_program;
         let pumpfun_account = &ctx.accounts.pumpfun_account;
         let hrvst_token_account = &mut ctx.accounts.hrvst_token_account;
         let user_hrvst_account = &mut ctx.accounts.user_hrvst_account;
         let sol_wallet = &mut ctx.accounts.sol_wallet;
+        let treasury_account = &mut ctx.accounts.treasury_account;
 
         require!(sol_amount > 0, ErrorCode::InvalidAmount);
+        require!(treasury_percentage <= 100, ErrorCode::InvalidPercentage);
 
-        // Transfer SOL from user's wallet to the reserve wallet
-        **sol_wallet.lamports.borrow_mut() += sol_amount;
-        **user_authority.lamports.borrow_mut() -= sol_amount;
+        // Calculate the amount to send to the treasury
+        let treasury_amount = sol_amount.checked_mul(treasury_percentage as u64).unwrap() / 100;
+        let remaining_sol_amount = sol_amount.checked_sub(treasury_amount).unwrap();
+
+        // Transfer SOL to the treasury account
+        **treasury_account.lamports.borrow_mut() += treasury_amount;
+        **user_authority.lamports.borrow_mut() -= treasury_amount;
+
+        // Transfer remaining SOL from user's wallet to the reserve wallet
+        **sol_wallet.lamports.borrow_mut() += remaining_sol_amount;
+        **user_authority.lamports.borrow_mut() -= remaining_sol_amount;
 
         // Cross-program invocation to Pumpfun to calculate HRVST amount based on bonding curve
         let seeds = &[b"pumpfun_bonding_curve", user_authority.key.as_ref()];
         let signer_seeds = &[&seeds[..]];
 
-        // Call Pumpfun program with the amount of SOL being provided
+        // Call Pumpfun program with the amount of remaining SOL being provided
         let cpi_accounts = [
             AccountMeta::new_readonly(user_authority.key(), true),
             AccountMeta::new(hrvst_token_account.to_account_info().key(), false),
@@ -45,7 +56,7 @@ mod hrvst_token_swap {
         let instruction = solana_program::instruction::Instruction {
             program_id: *pumpfun_program.key,
             accounts: cpi_accounts.to_vec(),
-            data: sol_amount.to_le_bytes().to_vec(), // Passing the SOL amount for calculation
+            data: remaining_sol_amount.to_le_bytes().to_vec(), // Passing the remaining SOL amount for calculation
         };
         invoke_signed(
             &instruction,
@@ -58,7 +69,7 @@ mod hrvst_token_swap {
         )?;
 
         // Example conversion - Update based on Pumpfun bonding curve response
-        let hrvst_amount = sol_amount.checked_mul(100).unwrap(); // This will be determined by Pumpfun logic
+        let hrvst_amount = remaining_sol_amount.checked_mul(100).unwrap(); // This will be determined by Pumpfun logic
 
         // Transfer HRVST tokens to the user's account
         let cpi_accounts = Transfer {
@@ -70,7 +81,7 @@ mod hrvst_token_swap {
         let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
         token::transfer(cpi_ctx, hrvst_amount)?;
 
-        msg!("Swapped SOL for HRVST successfully via Pumpfun");
+        msg!("Swapped SOL for HRVST successfully via Pumpfun with treasury deduction");
         Ok(())
     }
 
@@ -134,6 +145,23 @@ mod hrvst_token_swap {
 pub struct Initialize {}
 
 #[derive(Accounts)]
+pub struct SwapWithTreasury<'info> {
+    #[account(mut)]
+    pub user_hrvst_account: Account<'info, TokenAccount>, // User's HRVST token account
+    #[account(mut)]
+    pub reserve_hrvst_account: Account<'info, TokenAccount>, // Reserve's HRVST token account
+    #[account(mut)]
+    pub sol_wallet: AccountInfo<'info>, // Reserve's SOL wallet
+    #[account(mut)]
+    pub treasury_account: AccountInfo<'info>, // Treasury account for gaming revenue
+    pub user_authority: Signer<'info>, // User's signing authority
+    pub pumpfun_program: AccountInfo<'info>, // Pumpfun bonding curve program
+    pub pumpfun_account: AccountInfo<'info>, // Pumpfun bonding curve state account
+    pub reserve_authority: Signer<'info>, // Reserve authority
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
 pub struct SwapWithPumpfun<'info> {
     #[account(mut)]
     pub user_hrvst_account: Account<'info, TokenAccount>, // User's HRVST token account
@@ -152,4 +180,6 @@ pub struct SwapWithPumpfun<'info> {
 pub enum ErrorCode {
     #[msg("Amount must be greater than zero")]
     InvalidAmount,
+    #[msg("Percentage must be between 0 and 100")]
+    InvalidPercentage,
 }
